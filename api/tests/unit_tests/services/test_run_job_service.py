@@ -1,6 +1,6 @@
 import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 from flask import Flask
@@ -12,14 +12,17 @@ from repositories.run_job_store import RedisRunJobStore
 from services.run_job_contracts import JobOwner, JobPatch, JobRecord, JobStatus, OpenedJob
 from services.run_job_service import (
     POLL_INTERVAL_SECONDS,
+    RUN_INTERRUPTED,
     RUN_NOT_CONFIRMED,
     WAIT_MAX_SECONDS,
     JobCapacityError,
     JobNotFoundError,
     JobOpening,
+    MessageResult,
     RunJobService,
     RunResult,
     TaskControlStopper,
+    fail_if_reader_dead,
 )
 from tests.unit_tests.services.run_job_fakes import InMemoryRedis, InMemoryRunResults, RecordingTaskControl
 
@@ -570,3 +573,189 @@ def test_stop_sends_the_stop_when_the_ids_arrive_while_it_is_recording_the_reque
     service.stop(OWNER, opened.record.id)
 
     assert [stop.run_id for stop in harness.tasks.workflow_stops] == ["run-1"]
+
+
+def _finish_message_job(harness: Harness, job_id: str, *, status: JobStatus, message_id: str | None = "m1") -> None:
+    harness.store.patch(job_id, JobPatch(status=status, message_id=message_id))
+
+
+def test_a_finished_message_job_returns_the_saved_answer():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    _finish_message_job(harness, opened.record.id, status=JobStatus.SUCCEEDED)
+    harness.results.messages[("a1", "m1")] = MessageResult(answer="hello", error=None)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.answer, view.error) == (JobStatus.SUCCEEDED, "hello", None)
+
+
+def test_a_failed_message_job_returns_the_message_error():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    _finish_message_job(harness, opened.record.id, status=JobStatus.FAILED)
+    harness.results.messages[("a1", "m1")] = MessageResult(answer="partial", error="model failed")
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.answer, view.error) == (JobStatus.FAILED, "partial", "model failed")
+
+
+def test_a_failed_message_job_falls_back_to_the_record_error():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    harness.store.patch(opened.record.id, JobPatch(status=JobStatus.FAILED, message_id="m1", error="from record"))
+    harness.results.messages[("a1", "m1")] = MessageResult(answer="partial", error=None)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert view.error == "from record"
+
+
+def test_a_final_message_job_with_an_invisible_message_has_no_answer():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    _finish_message_job(harness, opened.record.id, status=JobStatus.SUCCEEDED)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.answer) == (JobStatus.SUCCEEDED, None)
+
+
+def test_a_final_message_job_without_a_message_id_has_no_answer():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    _finish_message_job(harness, opened.record.id, status=JobStatus.STOPPED, message_id=None)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.answer) == (JobStatus.STOPPED, None)
+
+
+def test_a_message_job_whose_reader_died_is_reported_as_interrupted():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    _lapse_alive_key(harness, opened.record.id)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.error) == (JobStatus.FAILED, RUN_INTERRUPTED)
+    stored = harness.store.get(opened.record.id)
+    assert stored is not None
+    assert (stored.status, stored.error) == (JobStatus.FAILED, RUN_INTERRUPTED)
+
+
+def test_a_message_job_with_a_live_reader_keeps_running():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.error) == (JobStatus.RUNNING, None)
+
+
+def test_a_graph_job_whose_reader_died_still_reads_the_run():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.ADVANCED_CHAT))
+    harness.store.patch(opened.record.id, JobPatch(run_id="run-1"))
+    harness.results.runs[("t1", "run-1")] = RunResult(status=JobStatus.RUNNING)
+    _lapse_alive_key(harness, opened.record.id)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.error) == (JobStatus.RUNNING, None)
+
+
+def test_a_finished_chatflow_job_returns_the_saved_answer_and_the_run_outputs():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.ADVANCED_CHAT))
+    harness.store.patch(opened.record.id, JobPatch(run_id="run-1", message_id="m1"))
+    harness.results.runs[("t1", "run-1")] = RunResult(status=JobStatus.SUCCEEDED, outputs={"answer": "from run"})
+    harness.results.messages[("a1", "m1")] = MessageResult(answer="from message", error="ignored")
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert view.answer == "from message"
+    assert view.outputs == {"answer": "from run"}
+    assert (view.status, view.error) == (JobStatus.SUCCEEDED, None)
+
+
+def test_a_running_chatflow_job_has_no_answer_yet():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.ADVANCED_CHAT))
+    harness.store.patch(opened.record.id, JobPatch(run_id="run-1", message_id="m1"))
+    harness.results.runs[("t1", "run-1")] = RunResult(status=JobStatus.RUNNING)
+    harness.results.messages[("a1", "m1")] = MessageResult(answer="partial", error=None)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert view.answer is None
+
+
+class ChangesAfterReadStore:
+    """A store whose is_alive reports a dead reader while get already returns a newer record."""
+
+    def __init__(self, newer: JobRecord) -> None:
+        self._newer = newer
+        self.patches: list[JobPatch] = []
+
+    def is_alive(self, _job_id: str) -> bool:
+        return False
+
+    def get(self, _job_id: str) -> JobRecord | None:
+        return self._newer
+
+    def patch(self, _job_id: str, patch: JobPatch) -> None:
+        self.patches.append(patch)
+
+
+def _stale(mode: AppMode = AppMode.CHAT) -> JobRecord:
+    return JobRecord(id="j1", owner=OWNER, mode=mode, op="start.test", status=JobStatus.RUNNING)
+
+
+def test_a_job_that_finished_after_the_stale_read_is_not_failed():
+    finished = replace(_stale(), status=JobStatus.SUCCEEDED, message_id="m1")
+    store = ChangesAfterReadStore(finished)
+
+    result = fail_if_reader_dead(store, _stale(), RUN_INTERRUPTED)
+
+    assert result == finished
+    assert store.patches == []
+
+
+def test_a_graph_job_that_got_a_run_id_after_the_stale_read_is_not_failed():
+    confirmed = replace(_stale(AppMode.WORKFLOW), run_id="run-1")
+    store = ChangesAfterReadStore(confirmed)
+
+    result = fail_if_reader_dead(store, _stale(AppMode.WORKFLOW), RUN_NOT_CONFIRMED)
+
+    assert result == confirmed
+    assert store.patches == []
+
+
+class AliveOnSecondLookStore(ChangesAfterReadStore):
+    def __init__(self, newer: JobRecord) -> None:
+        super().__init__(newer)
+        self._lookups = 0
+
+    def is_alive(self, _job_id: str) -> bool:
+        self._lookups += 1
+        return self._lookups > 1
+
+
+def test_a_message_job_whose_reader_came_back_is_not_failed():
+    store = AliveOnSecondLookStore(_stale())
+
+    result = fail_if_reader_dead(store, _stale(), RUN_INTERRUPTED)
+
+    assert result.status is JobStatus.RUNNING
+    assert store.patches == []
+
+
+def test_a_job_still_dead_on_the_fresh_read_is_failed_once():
+    store = ChangesAfterReadStore(_stale())
+
+    result = fail_if_reader_dead(store, _stale(), RUN_INTERRUPTED)
+
+    assert (result.status, result.error) == (JobStatus.FAILED, RUN_INTERRUPTED)
+    assert store.patches == [JobPatch(status=JobStatus.FAILED, error=RUN_INTERRUPTED)]

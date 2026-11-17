@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Any, Final, Protocol, runtime_checkable
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.app.apps.advanced_chat.app_generator import AdvancedChatAppGenerator
@@ -14,11 +15,11 @@ from core.app.apps.workflow.app_generator import WorkflowAppGenerator
 from core.app.entities.task_entities import StreamEvent
 from core.workflow.human_input_policy import HumanInputSurface
 from graphon.enums import WorkflowExecutionStatus
-from models.model import AppMode
+from models.model import AppMode, Message
 from repositories.factory import DifyAPIRepositoryFactory
 from services.run_job_contracts import JobStatus
 from services.run_job_reader import RUN_STATUS_TO_JOB_STATUS, decode_frame
-from services.run_job_service import RunResult
+from services.run_job_service import MessageResult, RunResult
 from services.workflow_event_snapshot_service import build_workflow_event_stream
 
 PENDING_FORM_IDLE_TIMEOUT_SECONDS: Final = 2
@@ -103,6 +104,20 @@ class SQLAlchemyRunResultReader:
         if status is None:
             return None
         return RunResult(status=status, outputs=row.outputs_dict, error=row.error)
+
+    def message(self, *, app_id: str, message_id: str) -> MessageResult | None:
+        """Read the saved answer and error of a message.
+
+        Precondition: ownership of the message was proven by the job that points at it.
+        Postcondition: the message's answer and error; None when no message has that id in the app. The session is
+        closed.
+        """
+        stmt = sa.select(Message.answer, Message.error).where(Message.id == message_id, Message.app_id == app_id)
+        with self._session_factory() as session:
+            row = session.execute(stmt).one_or_none()
+        if row is None:
+            return None
+        return MessageResult(answer=row.answer, error=row.error)
 
     def pending_form(self, *, tenant_id: str, app_id: str, run_id: str, mode: AppMode) -> Mapping[str, Any] | None:
         """Read the human input form a paused run waits on.

@@ -33,6 +33,7 @@ WAIT_MAX_SECONDS: Final = 45
 POLL_INTERVAL_SECONDS: Final = 1.0
 READER_THREAD_NAME: Final = "run-job-reader"
 RUN_NOT_CONFIRMED: Final = "run start was not confirmed; it may still execute"
+RUN_INTERRUPTED: Final = "run was interrupted"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -52,6 +53,12 @@ class RunResult:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class MessageResult:
+    answer: str
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class JobView:
     record: JobRecord
     status: JobStatus
@@ -67,6 +74,9 @@ class RunResultReader(Protocol):
 
     def pending_form(self, *, tenant_id: str, app_id: str, run_id: str, mode: AppMode) -> Mapping[str, Any] | None:
         """Precondition: the run is paused. Postcondition: its pending human input form, or None."""
+
+    def message(self, *, app_id: str, message_id: str) -> MessageResult | None:
+        """Precondition: none. Postcondition: the saved answer and error of the message, or None when not stored."""
 
 
 class RunTaskControl(Protocol):
@@ -94,20 +104,56 @@ class JobCapacityError(Exception):
     """The background run cap of this process is reached."""
 
 
+def _has_run_id(record: JobRecord) -> bool:
+    """Report whether the record already links to a run row.
+
+    Precondition: none.
+    Postcondition: true when run_id is set.
+    """
+    return record.run_id is not None
+
+
+def _never_confirmed(record: JobRecord) -> bool:
+    """Report that a message job has no state that confirms its reader besides the alive key.
+
+    Precondition: none.
+    Postcondition: always false.
+    """
+    return False
+
+
+_CONFIRMED_BY_FAMILY: Final[Mapping[JobFamily, Callable[[JobRecord], bool]]] = {
+    JobFamily.GRAPH: _has_run_id,
+    JobFamily.MESSAGE: _never_confirmed,
+}
+
+
 def fail_if_reader_dead(store: RunJobStore, record: JobRecord, error: str) -> JobRecord:
     """Fail a job whose reader has ended before the job reached a final status.
 
     Precondition: record is the stored state of the job. The reader refreshes the alive key on a timer for as long as
     it runs, frames or not, so the key lapses only when the reader has ended.
-    Postcondition: the record unchanged when it is final or its alive key is live; otherwise the record as FAILED
-    with the given error, which is also saved with store.patch.
+    Postcondition: the record unchanged when it is final or its alive key is live. Otherwise the job is read again
+    so a change made since record was read is not overwritten: the fresh record is returned untouched when it is
+    final, a GRAPH job now has a run id, or the alive key is live again; record is returned when the job is gone
+    from the store. In every other case the job is saved as FAILED with the given error through store.patch and
+    the fresh record is returned as FAILED.
     """
     if record.status.is_final:
         return record
     if store.is_alive(record.id):
         return record
-    store.patch(record.id, JobPatch(status=JobStatus.FAILED, error=error))
-    return replace(record, status=JobStatus.FAILED, error=error)
+    fresh = store.get(record.id)
+    if fresh is None:
+        return record
+    if fresh.status.is_final:
+        return fresh
+    if _CONFIRMED_BY_FAMILY[fresh.family](fresh):
+        return fresh
+    if store.is_alive(fresh.id):
+        return fresh
+    store.patch(fresh.id, JobPatch(status=JobStatus.FAILED, error=error))
+    return replace(fresh, status=JobStatus.FAILED, error=error)
 
 
 class _Counter:
@@ -353,13 +399,15 @@ class RunJobService:
         """Describe a job's current state.
 
         Precondition: none.
-        Postcondition: a view of the job; a GRAPH job with a stored run takes status, outputs and error from the
-        run, and its form from the pending form while paused (None otherwise). A GRAPH job
-        without a run id whose reader has ended and which is not final is FAILED with RUN_NOT_CONFIRMED, and that
-        is saved; once saved it is final for good, even if a run id and a run row appear later. Without a visible
-        run row, and for
-        MESSAGE jobs, the record's own status, error and form are used. Raises JobNotFoundError when the job is
-        missing or owned by someone else.
+        Postcondition: a view of the job. A GRAPH job with a stored run takes status, outputs and error from the
+        run, and its form from the pending form while paused (None otherwise). A GRAPH job without a run id whose
+        reader has ended and which is not final is FAILED with RUN_NOT_CONFIRMED, and that is saved; once saved it
+        is final for good, even if a run id and a run row appear later. Without a
+        visible run row the record's own status, error and form are used. A MESSAGE job whose reader has ended
+        and which is not final is FAILED with RUN_INTERRUPTED, and that is saved. For a job that is final, with
+        a message id and a visible message row, the answer is the message's answer; a MESSAGE job also takes the
+        message's error, with the record's error as the fallback. Raises JobNotFoundError when the job is missing
+        or owned by someone else.
         """
         record = self._store.get(job_id)
         if record is None:
@@ -374,20 +422,23 @@ class RunJobService:
         Precondition: record is stored.
         Postcondition: see view.
         """
-        fallback = JobView(record=record, status=record.status, error=record.error, form=record.form)
-        if record.family is not JobFamily.GRAPH:
-            return fallback
+        return _VIEWS_BY_FAMILY[record.family](self, record)
+
+    def _graph_view(self, record: JobRecord) -> JobView:
+        """Build the view of a GRAPH job.
+
+        Precondition: record is a GRAPH job.
+        Postcondition: see view.
+        """
         if record.status.is_final and record.error == RUN_NOT_CONFIRMED:
             # Already reported final: a run that starts late is not linked to the job.
-            return fallback
+            return _record_view(record)
         if record.run_id is None:
             unconfirmed = fail_if_reader_dead(self._store, record, RUN_NOT_CONFIRMED)
-            return JobView(
-                record=unconfirmed, status=unconfirmed.status, error=unconfirmed.error, form=unconfirmed.form
-            )
+            return _record_view(unconfirmed)
         run = self._results.run(tenant_id=record.owner.tenant_id, run_id=record.run_id)
         if run is None:
-            return fallback
+            return _record_view(record)
         form = None
         if run.status is JobStatus.PAUSED:
             form = self._results.pending_form(
@@ -396,7 +447,40 @@ class RunJobService:
                 run_id=record.run_id,
                 mode=record.mode,
             )
-        return JobView(record=record, status=run.status, outputs=run.outputs, error=run.error, form=form)
+        view = JobView(record=record, status=run.status, outputs=run.outputs, error=run.error, form=form)
+        if not run.status.is_final:
+            return view
+        message = self._saved_message(record)
+        if message is None:
+            return view
+        return replace(view, answer=message.answer)
+
+    def _message_view(self, record: JobRecord) -> JobView:
+        """Build the view of a MESSAGE job.
+
+        Precondition: record is a MESSAGE job.
+        Postcondition: see view.
+        """
+        checked = fail_if_reader_dead(self._store, record, RUN_INTERRUPTED)
+        view = _record_view(checked)
+        if not checked.status.is_final:
+            return view
+        message = self._saved_message(checked)
+        if message is None:
+            return view
+        error = message.error if message.error is not None else checked.error
+        return replace(view, answer=message.answer, error=error)
+
+    def _saved_message(self, record: JobRecord) -> MessageResult | None:
+        """Read the saved message of a finished job.
+
+        Precondition: the job's status is final.
+        Postcondition: the message row's answer and error; None when the record has no message id or the row is
+        not visible.
+        """
+        if record.message_id is None:
+            return None
+        return self._results.message(app_id=record.owner.app_id, message_id=record.message_id)
 
     def wait(self, owner: JobOwner, job_id: str, *, wait_seconds: int) -> JobView:
         """Wait for a job to finish or pause.
@@ -445,6 +529,21 @@ class RunJobService:
         stopping = replace(self._store.get(job_id) or record, stop_requested=True)
         self._stopper.stop(stopping)
         return self._view_of(stopping)
+
+
+def _record_view(record: JobRecord) -> JobView:
+    """Build a view from the record's own fields.
+
+    Precondition: none.
+    Postcondition: status, error and form are the record's; answer and outputs are None.
+    """
+    return JobView(record=record, status=record.status, error=record.error, form=record.form)
+
+
+_VIEWS_BY_FAMILY: Final[Mapping[JobFamily, Callable[[RunJobService, JobRecord], JobView]]] = {
+    JobFamily.GRAPH: RunJobService._graph_view,
+    JobFamily.MESSAGE: RunJobService._message_view,
+}
 
 
 def _settled(view: JobView) -> bool:

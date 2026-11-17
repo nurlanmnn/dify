@@ -7,7 +7,7 @@ from models.enums import CreatorUserRole
 from models.model import AppMode
 from services.app_task_service import WorkflowStopOutcome
 from services.run_job_contracts import JobRecord
-from services.run_job_service import RunResult
+from services.run_job_service import MessageResult, RunResult
 
 
 @dataclass
@@ -77,12 +77,16 @@ class RecordingJobStopper:
 class InMemoryRunResults:
     runs: dict[tuple[str, str], RunResult] = field(default_factory=dict)
     forms: dict[tuple[str, str, str, AppMode], Mapping[str, object]] = field(default_factory=dict)
+    messages: dict[tuple[str, str], MessageResult] = field(default_factory=dict)
 
     def run(self, *, tenant_id: str, run_id: str) -> RunResult | None:
         return self.runs.get((tenant_id, run_id))
 
     def pending_form(self, *, tenant_id: str, app_id: str, run_id: str, mode: AppMode) -> Mapping[str, object] | None:
         return self.forms.get((tenant_id, app_id, run_id, mode))
+
+    def message(self, *, app_id: str, message_id: str) -> MessageResult | None:
+        return self.messages.get((app_id, message_id))
 
 
 @dataclass(frozen=True)
