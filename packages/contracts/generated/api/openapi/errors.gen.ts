@@ -45,7 +45,7 @@ const zServiceApiDisabledError = /* @__PURE__ */ (() =>
     }),
   ))()
 
-export const post19Errors = {
+export const post21Errors = {
   paid_plan_required: { status: 403, data: zPaidPlanRequiredError },
   service_api_disabled: { status: 403, data: zServiceApiDisabledError },
 }
