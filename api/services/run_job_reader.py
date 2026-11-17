@@ -176,15 +176,20 @@ def _consume(frame: str, *, job_id: str, store: RunJobStore, stopper: JobStopper
     """Apply one frame to the job.
 
     Precondition: the job exists.
-    Postcondition: ids, form and status from the frame are stored;
-    ids count as stored only after the store accepted them, so a failed save is retried by the next frame that
-    carries them; a pending stop is sent once when the task id is first stored.
+    Postcondition: ids, form and status from the frame are stored; the job record is read only when the frame
+    carries an id not stored yet or its event has a handler; ids count as stored only after the store accepted
+    them, so a failed save is retried by the next frame that carries them; a pending stop is sent once when the
+    task id is first stored.
     """
     payload = decode_frame(frame)
     if payload is None:
         return
     task_id_known = "task_id" in stored_ids
     found = _unstored_ids(payload, stored_ids)
+    handler = EVENT_HANDLERS.get(str(payload.get("event")))
+    if not found:
+        if handler is None:
+            return
     if found:
         store.patch(job_id, _ids_patch(found))
         stored_ids.update(found)
@@ -196,7 +201,6 @@ def _consume(frame: str, *, job_id: str, store: RunJobStore, stopper: JobStopper
             stopper.stop(record)
     if record.status.is_final:
         return
-    handler = EVENT_HANDLERS.get(str(payload.get("event")))
     if handler is None:
         return
     patch = handler(_FrameContext(record=record, payload=payload))

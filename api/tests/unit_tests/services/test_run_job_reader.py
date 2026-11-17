@@ -436,3 +436,70 @@ def test_a_pending_stop_is_sent_once_after_a_failed_id_save(redis: InMemoryRedis
     _read(store, stopper, frames)
 
     assert [(record.task_id, record.run_id) for record in stopper.stopped] == [("task-1", "run-1")]
+
+
+class CountingStore(RedisRunJobStore):
+    def __init__(self, redis: InMemoryRedis) -> None:
+        super().__init__(redis_client=redis)
+        self.touches = 0
+        self.gets = 0
+        self.patches = 0
+
+    def touch(self, job_id: str) -> None:
+        self.touches += 1
+        super().touch(job_id)
+
+    def get(self, job_id: str) -> JobRecord | None:
+        self.gets += 1
+        return super().get(job_id)
+
+    def patch(self, job_id: str, patch: JobPatch) -> None:
+        self.patches += 1
+        super().patch(job_id, patch)
+
+
+CHAT_IDS = {"task_id": "task-1", "message_id": "msg-1", "conversation_id": "conv-1"}
+
+
+def test_token_frames_with_known_ids_make_no_store_call(redis: InMemoryRedis, stopper: RecordingJobStopper) -> None:
+    store = CountingStore(redis)
+    _open(store, AppMode.CHAT)
+    first = _frame(StreamEvent.MESSAGE, answer="a", **CHAT_IDS)
+    tokens = [_frame(StreamEvent.MESSAGE, answer="t", **CHAT_IDS) for _ in range(50)]
+    tokens += [_frame(StreamEvent.MESSAGE, answer="t") for _ in range(50)]
+    counts_at_end: list[tuple[int, int]] = []
+
+    def frames() -> Iterator[str]:
+        yield first
+        store.gets = store.patches = 0
+        yield from tokens
+        counts_at_end.append((store.gets, store.patches))
+
+    read_to_end(job_id=JOB_ID, frames=frames(), store=store, stopper=stopper)
+
+    assert counts_at_end == [(0, 0)]
+
+
+def test_a_frame_with_a_handler_reads_the_job_record(redis: InMemoryRedis, stopper: RecordingJobStopper) -> None:
+    store = CountingStore(redis)
+    _open(store, AppMode.CHAT)
+    store.gets = 0
+
+    read_to_end(
+        job_id=JOB_ID,
+        frames=[_frame(StreamEvent.MESSAGE_END, task_id="task-1", id="msg-1", metadata={})],
+        store=store,
+        stopper=stopper,
+    )
+
+    assert store.gets >= 1
+
+
+def test_a_failed_alive_refresh_does_not_lose_the_frame(redis: InMemoryRedis, stopper: RecordingJobStopper) -> None:
+    store = TouchFailsOnceStore(redis)
+    _open(store, AppMode.CHAT)
+    store.failures_left = 1
+
+    record = _read(store, stopper, [_frame(StreamEvent.MESSAGE_END, task_id="task-1", id="msg-1", metadata={})])
+
+    assert record.status is JobStatus.SUCCEEDED
