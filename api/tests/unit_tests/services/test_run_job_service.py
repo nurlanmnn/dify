@@ -1,9 +1,10 @@
 import json
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
 import pytest
-from flask import Flask
+from flask import Flask, g
 
 from core.app.entities.task_entities import StreamEvent
 from models.enums import CreatorUserRole
@@ -11,6 +12,7 @@ from models.model import AppMode
 from repositories.run_job_store import RedisRunJobStore
 from services.run_job_contracts import JobOwner, JobPatch, JobRecord, JobStatus, OpenedJob
 from services.run_job_service import (
+    BOOKKEEPING_ERRORS,
     POLL_INTERVAL_SECONDS,
     RUN_INTERRUPTED,
     RUN_NOT_CONFIRMED,
@@ -253,6 +255,33 @@ def test_attach_reads_the_stream_on_another_thread_and_frees_its_slot():
     assert stored.status is JobStatus.SUCCEEDED
     assert stored.task_id == "task-1"
     assert harness.service.open(_opening()).created is True
+
+
+@dataclass
+class ReaderAppContextProbe:
+    request_g_id: int | None = None
+    reader_g_id: int | None = None
+    reader_sees_request_marker: bool | None = None
+
+    def frames(self) -> Iterator[str]:
+        self.reader_g_id = id(g._get_current_object())
+        self.reader_sees_request_marker = hasattr(g, "request_marker")
+        yield f"data: {json.dumps({'event': StreamEvent.MESSAGE_END.value, 'task_id': 'task-1'})}\n\n"
+
+
+@pytest.mark.usefixtures("request_context")
+def test_attach_reads_the_stream_in_its_own_app_context():
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    probe = ReaderAppContextProbe()
+    g.request_marker = True
+    probe.request_g_id = id(g._get_current_object())
+
+    harness.service.attach(opened.record.id, probe.frames()).join(THREAD_TIMEOUT)
+
+    assert probe.reader_g_id is not None
+    assert probe.reader_g_id != probe.request_g_id
+    assert probe.reader_sees_request_marker is False
 
 
 def test_view_hides_a_job_from_another_owner():
@@ -796,6 +825,18 @@ def test_a_message_job_failed_as_interrupted_has_no_answer_even_when_a_message_r
     view = harness.service.view(OWNER, opened.record.id)
 
     assert (view.status, view.error, view.answer) == (JobStatus.FAILED, RUN_INTERRUPTED, None)
+
+
+@pytest.mark.parametrize("bookkeeping_error", sorted(BOOKKEEPING_ERRORS))
+def test_a_message_job_failed_by_our_bookkeeping_has_no_answer_even_when_a_message_row_exists(bookkeeping_error):
+    harness = _harness()
+    opened = harness.service.open(_opening(AppMode.CHAT))
+    harness.store.patch(opened.record.id, JobPatch(status=JobStatus.FAILED, message_id="m1", error=bookkeeping_error))
+    harness.results.messages[("a1", "m1")] = MessageResult(answer="", error=None)
+
+    view = harness.service.view(OWNER, opened.record.id)
+
+    assert (view.status, view.error, view.answer) == (JobStatus.FAILED, bookkeeping_error, None)
 
 
 def test_stop_of_a_message_job_whose_reader_died_reports_interrupted_and_sends_nothing():

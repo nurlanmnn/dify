@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-from flask import copy_current_request_context
+from flask import copy_current_request_context, current_app
 
 from models.enums import CreatorUserRole
 from models.model import AppMode
@@ -23,7 +23,7 @@ from services.run_job_contracts import (
     OpenedJob,
     RunJobStore,
 )
-from services.run_job_reader import JobStopper, read_to_end
+from services.run_job_reader import NO_RESULT_ERROR, JobStopper, read_to_end
 
 if TYPE_CHECKING:
     from services.app_task_service import WorkflowStopOutcome
@@ -34,6 +34,7 @@ POLL_INTERVAL_SECONDS: Final = 1.0
 READER_THREAD_NAME: Final = "run-job-reader"
 RUN_NOT_CONFIRMED: Final = "run start was not confirmed; it may still execute"
 RUN_INTERRUPTED: Final = "run was interrupted"
+BOOKKEEPING_ERRORS: Final = frozenset({RUN_INTERRUPTED, RUN_NOT_CONFIRMED, NO_RESULT_ERROR})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -318,6 +319,16 @@ class RunJobService:
         if not self._unreserve(job_id):
             raise ValueError(f"Job {job_id} holds no reserved background slot")
         context = contextvars.copy_context()
+        flask_app = current_app._get_current_object()  # type: ignore[attr-defined]
+
+        def read_in_app_context() -> None:
+            """Read the stream under an app context of its own.
+
+            Precondition: runs inside the copied contextvars, which hold the request's app context.
+            Postcondition: the stream was read to its end; its session and g belong to this context, not the request's.
+            """
+            with flask_app.app_context():
+                read_to_end(job_id=job_id, frames=frames, store=self._store, stopper=self._stopper)
 
         def reader_with_context() -> None:
             """Read the stream under the copied contexts.
@@ -326,13 +337,7 @@ class RunJobService:
             Postcondition: the stream was read to its end and the slot is released.
             """
             try:
-                context.run(
-                    read_to_end,
-                    job_id=job_id,
-                    frames=frames,
-                    store=self._store,
-                    stopper=self._stopper,
-                )
+                context.run(read_in_app_context)
             finally:
                 self._slots.release()
 
@@ -459,7 +464,7 @@ class RunJobService:
         view = _record_view(checked)
         if not checked.status.is_final:
             return view
-        if checked.error == RUN_INTERRUPTED:
+        if checked.error in BOOKKEEPING_ERRORS:
             return view
         message = self._saved_message(checked)
         if message is None:
