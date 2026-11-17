@@ -72,10 +72,15 @@ class World:
             caller_id=caller_id or self.caller_id,
         )
 
-    def open_job(self, *, caller_id: str | None = None, patch: JobPatch | None = None) -> str:
-        opened = self.service.open(
-            JobOpening(owner=self.owner(caller_id), mode=AppMode.WORKFLOW, op="start.x", idempotency_key=None)
-        )
+    def open_job(
+        self,
+        *,
+        caller_id: str | None = None,
+        patch: JobPatch | None = None,
+        mode: AppMode = AppMode.WORKFLOW,
+        op: str = "start.x",
+    ) -> str:
+        opened = self.service.open(JobOpening(owner=self.owner(caller_id), mode=mode, op=op, idempotency_key=None))
         if patch is not None:
             self.store.patch(opened.record.id, patch)
         return opened.record.id
@@ -218,6 +223,40 @@ def test_a_final_job_carries_no_hints(world: World, status: JobStatus) -> None:
     body = world.wait(job_id).get_json()
 
     assert body["status"] == status.value
+    assert body["hints"] == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "op"),
+    [
+        (AppMode.CHAT, "start.console_app.chat"),
+        (AppMode.AGENT_CHAT, "start.console_app.chat"),
+        (AppMode.ADVANCED_CHAT, "start.console_app.advanced_chat"),
+    ],
+)
+def test_a_finished_chat_job_hints_a_reply_in_the_same_conversation(world: World, mode: AppMode, op: str) -> None:
+    job_id = world.open_job(mode=mode, op=op, patch=JobPatch(status=JobStatus.SUCCEEDED, conversation_id="c1"))
+
+    body = world.wait(job_id).get_json()
+
+    assert body["hints"] == [
+        {
+            "summary": jobs.REPLY_HINT_SUMMARY,
+            "op": op,
+            "input": {"app_id": world.client.app_id, "conversation_id": "c1", "query": None, "inputs": {}},
+            "form": None,
+        }
+    ]
+
+
+def test_a_finished_completion_job_has_no_reply_hint(world: World) -> None:
+    job_id = world.open_job(
+        mode=AppMode.COMPLETION, op="start.console_app.completion", patch=JobPatch(status=JobStatus.SUCCEEDED)
+    )
+
+    body = world.wait(job_id).get_json()
+
+    assert body["status"] == "succeeded"
     assert body["hints"] == []
 
 

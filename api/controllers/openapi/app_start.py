@@ -12,7 +12,13 @@ from controllers.openapi._audit import emit_app_run
 from controllers.openapi._contract import Effect, Example, Kind, endpoint
 from controllers.openapi._errors import JobCapacityReached, JobNotFound
 from controllers.openapi._files import end_read_transaction
-from controllers.openapi._models import AdvancedChatStartPayload, JobState, WorkflowStartPayload
+from controllers.openapi._models import (
+    AdvancedChatStartPayload,
+    ChatStartPayload,
+    CompletionStartPayload,
+    JobState,
+    WorkflowStartPayload,
+)
 from controllers.openapi.app_run import _RUN_GUARDS, _generate_args, _require_mode, _stream
 from controllers.openapi.auth.context import Context
 from controllers.openapi.jobs import job_owner, job_state
@@ -24,6 +30,8 @@ from services.run_job_service import JobCapacityError, JobNotFoundError, JobOpen
 
 WORKFLOW_START_OP: Final = "start.console_app.workflow"
 ADVANCED_CHAT_START_OP: Final = "start.console_app.advanced_chat"
+CHAT_START_OP: Final = "start.console_app.chat"
+COMPLETION_START_OP: Final = "start.console_app.completion"
 _START_FIELDS: Final = frozenset({"wait_seconds", "idempotency_key"})
 _JOB_STATE: Final = (200, JobState, "Job state")
 APPS_SURFACE: Final = "apps"
@@ -34,7 +42,7 @@ class _Closable(Protocol):
     def close(self) -> None: ...
 
 
-type StartPayload = WorkflowStartPayload | AdvancedChatStartPayload
+type StartPayload = WorkflowStartPayload | AdvancedChatStartPayload | ChatStartPayload | CompletionStartPayload
 
 
 def _launch(ctx: Context, body: StartPayload, *, run_jobs: RunJobService, opened: OpenedJob, key: str | None) -> None:
@@ -124,3 +132,41 @@ class AdvancedChatStartApi(Resource):
     )
     def post(self, ctx: Context, app_id: str, *, body: AdvancedChatStartPayload):
         return start_job(ctx, body, op=ADVANCED_CHAT_START_OP, modes=(AppMode.ADVANCED_CHAT,))
+
+
+@openapi_ns.route("/apps/<string:app_id>/chat:start")
+class ChatStartApi(Resource):
+    @endpoint(
+        op=CHAT_START_OP,
+        pat_policy=PersonalAccessTokenPolicy.RESOURCE_CALLS,
+        kind=Kind.OBJECT,
+        effect=Effect.WRITE,
+        summary="Start a chat or agent-chat app as a background job and wait for its reply",
+        requirements=_RUN_GUARDS,
+        body=ChatStartPayload,
+        examples=(
+            Example(
+                title="Start a new conversation", input={"app_id": "<app_id>", "query": "Summarise the latest release"}
+            ),
+        ),
+        returns=_JOB_STATE,
+    )
+    def post(self, ctx: Context, app_id: str, *, body: ChatStartPayload):
+        return start_job(ctx, body, op=CHAT_START_OP, modes=(AppMode.CHAT, AppMode.AGENT_CHAT))
+
+
+@openapi_ns.route("/apps/<string:app_id>/completion:start")
+class CompletionStartApi(Resource):
+    @endpoint(
+        op=COMPLETION_START_OP,
+        pat_policy=PersonalAccessTokenPolicy.RESOURCE_CALLS,
+        kind=Kind.OBJECT,
+        effect=Effect.WRITE,
+        summary="Start a completion app as a background job and wait for its result",
+        requirements=_RUN_GUARDS,
+        body=CompletionStartPayload,
+        examples=(Example(title="Start a completion", input={"app_id": "<app_id>", "inputs": {"topic": "report"}}),),
+        returns=_JOB_STATE,
+    )
+    def post(self, ctx: Context, app_id: str, *, body: CompletionStartPayload):
+        return start_job(ctx, body, op=COMPLETION_START_OP, modes=(AppMode.COMPLETION,))

@@ -431,6 +431,10 @@ class AdvancedChatStartPayload(AdvancedChatRunPayload, _StartFields):
     model_config = ConfigDict(extra="forbid")
 
 
+class ChatStartPayload(ChatRunPayload, _StartFields):
+    model_config = ConfigDict(extra="forbid")
+
+
 class JobWaitQuery(BaseModel):
     wait_seconds: int = Field(
         default=WAIT_DEFAULT_SECONDS,
@@ -455,6 +459,10 @@ class CompletionRunPayload(RunPayloadBase):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(default="", description="Prompt text; most completion apps take their input through `inputs`")
+
+
+class CompletionStartPayload(CompletionRunPayload, _StartFields):
+    model_config = ConfigDict(extra="forbid")
 
 
 class FileUploadPayload(BaseModel):
