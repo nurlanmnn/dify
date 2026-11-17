@@ -217,7 +217,7 @@ def test_a_paused_job_with_an_unreadable_form_hints_only_wait(world: World) -> N
 
 
 @pytest.mark.parametrize("status", [JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.STOPPED])
-def test_a_final_job_carries_no_hints(world: World, status: JobStatus) -> None:
+def test_a_final_job_without_a_conversation_carries_no_hints(world: World, status: JobStatus) -> None:
     job_id = world.open_job(patch=JobPatch(status=status))
 
     body = world.wait(job_id).get_json()
